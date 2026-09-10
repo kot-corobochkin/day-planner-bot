@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import ContextTypes, ConversationHandler
@@ -63,6 +64,7 @@ from app.services.llm_provider import LLMProviderError
 from app.services.day_strategy import STRATEGIES, recommend_strategies
 from app.services.statistics_service import StatisticsService
 from app.services.weekly_achievements import WeeklyAchievementService
+from app.repositories.user_repository import UserRepository
 
 
 logger = logging.getLogger(__name__)
@@ -160,6 +162,19 @@ def _weekly_achievement_service(
     if application is None:
         return None
     return application.bot_data.get("weekly_achievement_service")
+
+
+def _today_for_user(context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> date | None:
+    db = context.application.bot_data["db"]
+    with db.connection() as conn:
+        user = UserRepository(conn).get_user_by_telegram_id(telegram_id)
+    if user is None:
+        return None
+    return datetime.now(ZoneInfo(user.timezone)).date()
+
+
+def _is_week_end(day: date) -> bool:
+    return day.weekday() == 6
 
 
 def _award_for_completed_task(context, *, telegram_id: int, task_id: int):
@@ -2673,7 +2688,10 @@ async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     period = (context.args[0].casefold() if context.args else "week")
-    today = date.today()
+    today = _today_for_user(context, update.effective_user.id)
+    if today is None:
+        await update.message.reply_text("Пользователь ещё не зарегистрирован. Используйте /start.")
+        return
     if period in {"week", "неделя", "неделю", "7", "7d"}:
         start_date = today - timedelta(days=today.weekday())
         period_name = "текущую неделю"
@@ -2698,7 +2716,7 @@ async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Пользователь ещё не зарегистрирован. Используйте /start.")
         return
     text = format_period_stats(stats, period_name)
-    if include_achievements:
+    if include_achievements and _is_week_end(today):
         try:
             achievement_service = _weekly_achievement_service(context)
             report = achievement_service.get_or_create_report(
@@ -2727,6 +2745,8 @@ async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "\n\n🎭 Комитет ачивок сегодня не собрал кворум. "
                 f"Статистика всё равно действительна. Код: {failure_kind}."
             )
+    elif include_achievements:
+        text += "\n\n🤖 AI-отчёт и недельная ачивка появятся в конце недели, в воскресенье."
     for chunk in _split_telegram_message(text):
         await update.message.reply_text(chunk)
 
